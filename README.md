@@ -48,9 +48,9 @@ TIMEZONE=Europe/Moscow
 `GROUP_CHAT_ID` необязателен — его можно указать, если нужно подключить
 конкретную группу сразу, не добавляя бота заново.
 
-`ADMIN_IDS` — ваши Telegram ID (через запятую). Если оставить пустым,
-админ-команды будут доступны администраторам группы. Узнать свой ID можно
-у бота [@userinfobot](https://t.me/userinfobot).
+`ADMIN_IDS` — Telegram ID владельца бота (через запятую). Ему доступны
+`/chats` и `/unregister`. Варианты опроса могут менять и администраторы групп.
+Узнать свой ID можно у бота [@userinfobot](https://t.me/userinfobot).
 
 6. Запустите:
 
@@ -110,9 +110,40 @@ Telegram ID.
 | `RETENTION_DAYS` | `0` | Хранить ответы N дней (`0` — бессрочно) |
 | `DB_PATH` | `activity.db` | Путь к SQLite |
 
-## Запуск на сервере
+## Развёртывание на VPS
 
-Пример unit-файла systemd (`/etc/systemd/system/activity-bot.service`):
+Требования: Linux (Ubuntu/Debian), Python 3.10+, git и systemd. Бот работает
+через long polling, поэтому домен, HTTPS и открытые входящие порты не нужны.
+
+### 1. Подготовка сервера
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv git
+sudo adduser --system --group activity
+sudo mkdir -p /opt/activity
+sudo chown activity:activity /opt/activity
+```
+
+### 2. Код и зависимости
+
+```bash
+sudo git clone <REPO_URL> /opt/activity
+cd /opt/activity
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env
+nano .env
+chmod 600 .env
+sudo chown -R activity:activity /opt/activity
+```
+
+В `.env` укажите `BOT_TOKEN`, `ADMIN_IDS` и при необходимости `TIMEZONE`.
+Файл содержит секреты и в git не попадает (см. `.gitignore`).
+
+### 3. systemd
+
+Создайте `/etc/systemd/system/activity-bot.service`:
 
 ```ini
 [Unit]
@@ -134,7 +165,48 @@ WantedBy=multi-user.target
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now activity-bot
+sudo systemctl status activity-bot
 sudo journalctl -u activity-bot -f
+```
+
+### 4. CI/CD через GitHub Actions
+
+Файл `.github/workflows/deploy.yml` при push в `main` (или ручном запуске)
+заходит на сервер по SSH, делает `git pull`, обновляет зависимости и
+перезапускает сервис.
+
+Один раз создайте на сервере отдельный ключ для деплоя:
+
+```bash
+ssh-keygen -t ed25519 -C github-actions -f ~/.ssh/gh_actions -N ""
+cat ~/.ssh/gh_actions.pub >> ~/.ssh/authorized_keys
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/authorized_keys
+cat ~/.ssh/gh_actions
+```
+
+Публичный ключ остаётся на сервере, приватный добавьте в GitHub:
+Settings → Secrets and variables → Actions.
+
+| Secret | Значение |
+|---|---|
+| `SSH_HOST` | IP или домен сервера |
+| `SSH_USER` | пользователь для деплоя (например `root`) |
+| `SSH_PORT` | SSH-порт (обычно `22`) |
+| `SSH_KEY` | приватный ключ `gh_actions` целиком |
+
+После этого запустите workflow вручную (Actions → Deploy → Run workflow)
+или сделайте `git push` в `main`. Сервис работает под пользователем
+`activity`, поэтому каталог `/opt/activity` и `.env` должны быть ему доступны.
+
+### Обновление и диагностика
+
+Обычное обновление — push в `main` (workflow сделает всё сам). Вручную:
+
+```bash
+sudo systemctl restart activity-bot
+sudo systemctl status activity-bot
+sudo journalctl -u activity-bot -n 50 --no-pager
 ```
 
 ## Приватность

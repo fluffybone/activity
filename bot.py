@@ -499,10 +499,6 @@ async def cmd_poll(
     sent = await post_poll(bot, db, config, current_chat_id=current_chat_id)
     if sent == 0:
         await message.reply("Опрос не отправлен: нет групп в рассылке или не настроены варианты (/addoption).")
-    elif current_chat_id is not None:
-        await message.reply("Опрос отправлен в этот чат.")
-    else:
-        await message.reply(f"Опрос отправлен в {sent} чат(ов).")
 
 
 @router.message(Command("my"))
