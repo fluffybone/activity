@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>График активности — 1–7 января 2027</title>
+<style>
+:root {
+    color-scheme: light;
+}
+* {
+    box-sizing: border-box;
+}
+body {
+    margin: 0;
+    padding: 24px;
+    background: #eef1f5;
+    color: #1b2430;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+}
+.wrap {
+    max-width: 1500px;
+    margin: 0 auto;
+    padding: 24px;
+    background: #ffffff;
+    border-radius: 16px;
+    box-shadow: 0 10px 30px rgba(20, 30, 50, 0.08);
+}
+h1 {
+    margin: 0 0 4px;
+    font-size: 22px;
+    font-weight: 700;
+}
+.subtitle {
+    margin: 0 0 18px;
+    color: #6b7785;
+    font-size: 13px;
+}
+.scroll {
+    overflow-x: auto;
+}
+table {
+    border-collapse: separate;
+    border-spacing: 0;
+    --cw: 48px;
+}
+table.fit {
+    width: 100%;
+    table-layout: fixed;
+}
+table.fit .corner,
+table.fit .user {
+    width: 180px;
+}
+table.fit .day,
+table.fit .cell {
+    min-width: 0;
+}
+th,
+td {
+    padding: 0;
+}
+.corner {
+    padding: 0 14px 8px 4px;
+    color: #6b7785;
+    font-size: 11px;
+    font-weight: 600;
+    text-align: left;
+}
+.day {
+    min-width: var(--cw);
+    padding: 0 2px 8px;
+    color: #6b7785;
+    font-size: 11px;
+    font-weight: 600;
+    text-align: center;
+}
+.day .dnum {
+    display: block;
+    color: #1b2430;
+    font-size: 12px;
+}
+.day .dwd {
+    display: block;
+    color: #95a1ad;
+    font-size: 10px;
+    font-weight: 500;
+}
+.user {
+    height: 34px;
+    padding: 0 14px 0 4px;
+    font-size: 13px;
+    font-weight: 500;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.cell {
+    min-width: var(--cw);
+    height: 34px;
+    padding: 2px;
+    border-top: 1px solid #eef1f5;
+    border-left: 1px solid #f4f6f9;
+}
+.cell.weekend {
+    background: #fafbfc;
+}
+.cell-inner {
+    display: flex;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    border-radius: 5px;
+}
+.cell.empty .cell-inner {
+    background: #f4f6f9;
+}
+.seg {
+    flex: 1 1 0;
+}
+.seg + .seg {
+    box-shadow: -1px 0 0 rgba(255, 255, 255, 0.55);
+}
+.legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 20px;
+    margin-top: 20px;
+}
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+}
+.swatch {
+    width: 14px;
+    height: 14px;
+    border-radius: 4px;
+}
+.empty-note {
+    padding: 32px 0;
+    color: #6b7785;
+    font-size: 15px;
+    text-align: center;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>График активности</h1>
+<p class="subtitle">1–7 января 2027 · пользователи × даты</p>
+<p class="empty-note">За выбранный период ответов нет</p>
+<div class="legend"><div class="legend-item"><span class="swatch" style="background:#3498DB"></span><span>Тренировка</span></div><div class="legend-item"><span class="swatch" style="background:#2ECC71"></span><span>Шаги</span></div><div class="legend-item"><span class="swatch" style="background:#F1C40F"></span><span>Танцы</span></div><div class="legend-item"><span class="swatch" style="background:#9B59B6"></span><span>Падел</span></div><div class="legend-item"><span class="swatch" style="background:#E3F2FD"></span><span>Отдых</span></div><div class="legend-item"><span class="swatch" style="background:#FCE4EC"></span><span>На ленивом</span></div></div>
+</div>
+</body>
+</html>
