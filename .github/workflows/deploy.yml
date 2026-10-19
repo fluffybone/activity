@@ -1,0 +1,39 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script_stop: true
+          script: |
+            set -e
+            cd /opt/activity
+            if [ ! -f .env ]; then
+              echo "На сервере нет /opt/activity/.env"
+              exit 1
+            fi
+            git config --global --add safe.directory /opt/activity
+            git pull --ff-only
+            if [ ! -d .venv ]; then
+              python3 -m venv .venv
+            fi
+            .venv/bin/pip install --quiet -r requirements.txt
+            chown -R activity:activity /opt/activity
+            systemctl restart activity-bot
+            systemctl is-active activity-bot
