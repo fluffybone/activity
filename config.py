@@ -58,6 +58,9 @@ class Config:
     weekly_report_day: str
     weekly_report_hour: int
     weekly_report_minute: int
+    motivation_day: str
+    motivation_hour: int
+    motivation_minute: int
     retention_days: int
     db_path: str
 
@@ -90,6 +93,13 @@ def load_config() -> Config:
             f"получено: {weekly_report_day!r}"
         )
 
+    motivation_day = os.getenv("MOTIVATION_DAY", "mon").strip().lower()
+    if motivation_day not in WEEKDAYS:
+        raise SystemExit(
+            f"MOTIVATION_DAY должен быть одним из {', '.join(sorted(WEEKDAYS))}, "
+            f"получено: {motivation_day!r}"
+        )
+
     return Config(
         bot_token=token,
         group_chat_id=group_chat_id,
@@ -100,6 +110,9 @@ def load_config() -> Config:
         weekly_report_day=weekly_report_day,
         weekly_report_hour=_env_int("WEEKLY_REPORT_HOUR", 21, 0, 23),
         weekly_report_minute=_env_int("WEEKLY_REPORT_MINUTE", 0, 0, 59),
+        motivation_day=motivation_day,
+        motivation_hour=_env_int("MOTIVATION_HOUR", 9, 0, 23),
+        motivation_minute=_env_int("MOTIVATION_MINUTE", 0, 0, 59),
         retention_days=_env_int("RETENTION_DAYS", 0, 0, 3650),
         db_path=os.getenv("DB_PATH", "activity.db").strip() or "activity.db",
     )

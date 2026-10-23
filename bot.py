@@ -4,29 +4,38 @@ import asyncio
 import html
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BufferedInputFile,
+    CallbackQuery,
     ChatMemberUpdated,
     ErrorEvent,
     InputPollOption,
+    InlineKeyboardMarkup,
     Message,
     PollAnswer,
     User,
 )
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from charts import MONTHS_GENITIVE, build_chart_html, period_label
 from config import Config, load_config
 from db import Database
+from motivation import motivation_for_week
 
 router = Router()
 
@@ -44,9 +53,32 @@ COMMANDS = [
     BotCommand(command="poll", description="Отправить опрос сейчас (админ)"),
     BotCommand(command="chats", description="Группы в рассылке (админ)"),
     BotCommand(command="unregister", description="Убрать группу из рассылки (админ)"),
+    BotCommand(command="activity", description="Активности (админ)"),
+    BotCommand(command="motivation", description="Мотивация недели (админ)"),
+    BotCommand(command="cancel", description="Отменить создание"),
     BotCommand(command="id", description="ID этого чата"),
     BotCommand(command="help", description="Справка"),
 ]
+
+WEEKDAYS = [
+    ("mon", "Пн"),
+    ("tue", "Вт"),
+    ("wed", "Ср"),
+    ("thu", "Чт"),
+    ("fri", "Пт"),
+    ("sat", "Сб"),
+    ("sun", "Вс"),
+]
+WEEKDAY_LABELS = dict(WEEKDAYS)
+
+
+class ActivityForm(StatesGroup):
+    title = State()
+    description = State()
+    schedule = State()
+    custom_days = State()
+    run_date = State()
+    run_time = State()
 
 
 def _today(config: Config) -> date:
@@ -55,6 +87,11 @@ def _today(config: Config) -> date:
 
 def _human_date(value: date) -> str:
     return f"{value.day} {MONTHS_GENITIVE[value.month - 1]} {value.year}"
+
+
+def _motivation_text(config: Config) -> str:
+    week = _today(config).isocalendar().week
+    return f"<b>Мотивация недели</b>\n\n{motivation_for_week(week)}"
 
 
 def _display_name(user: User) -> str:
@@ -106,7 +143,12 @@ def _help_text(config: Config) -> str:
         "<b>Для администраторов группы</b>\n"
         "/addoption Название [цвет] — добавить вариант в эту группу\n"
         "/deloption ID или название — скрыть вариант в этой группе\n"
-        "/poll — отправить опрос сейчас в эту группу\n\n"
+        "/poll — отправить опрос сейчас в эту группу\n"
+        "/activity add — создать активность с расписанием\n"
+        "/activity — список активностей группы\n"
+        "/activity del ID — удалить активность\n"
+        "/motivation — показать мотивацию недели\n"
+        "/cancel — отменить создание активности\n\n"
         "<b>Только для владельца бота</b>\n"
         "/chats — список групп в рассылке\n"
         "/unregister — убрать эту группу из рассылки\n\n"
@@ -114,6 +156,57 @@ def _help_text(config: Config) -> str:
         f"<b>{config.weekly_report_hour:02d}:{config.weekly_report_minute:02d}</b> "
         f"({config.timezone})."
     )
+
+
+def _not_command(message: Message) -> bool:
+    return not (message.text or "").startswith("/")
+
+
+def _parse_time_value(value: str) -> tuple[int, int] | None:
+    match = re.fullmatch(r"\s*(\d{1,2})[:.](\d{2})\s*", value)
+    if match is None:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+def _schedule_label(days: str, run_date: str | None, run_time: str) -> str:
+    if days == "daily":
+        return f"ежедневно в {run_time}"
+    if days == "once":
+        return f"разово {run_date} в {run_time}"
+    codes = [code for code in days.split(",") if code]
+    if codes == ["mon", "tue", "wed", "thu", "fri"]:
+        return f"будни в {run_time}"
+    if len(codes) == 7:
+        return f"ежедневно в {run_time}"
+    labels = ", ".join(WEEKDAY_LABELS[code] for code in codes if code in WEEKDAY_LABELS)
+    return f"{labels} в {run_time}"
+
+
+def _schedule_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Будни", callback_data="act:sched:weekdays")
+    builder.button(text="Ежедневно", callback_data="act:sched:daily")
+    builder.button(text="Разово", callback_data="act:sched:once")
+    builder.button(text="Выбрать дни", callback_data="act:sched:custom")
+    builder.button(text="Отмена", callback_data="act:cancel")
+    builder.adjust(2, 2, 1)
+    return builder.as_markup()
+
+
+def _weekdays_keyboard(selected: list[str]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    selected_set = set(selected)
+    for code, label in WEEKDAYS:
+        prefix = "✅ " if code in selected_set else ""
+        builder.button(text=f"{prefix}{label}", callback_data=f"act:day:{code}")
+    builder.button(text="Готово", callback_data="act:days:done")
+    builder.button(text="Отмена", callback_data="act:cancel")
+    builder.adjust(4, 3, 1, 1)
+    return builder.as_markup()
 
 
 def _is_owner(message: Message, config: Config) -> bool:
@@ -230,6 +323,109 @@ async def post_poll(
         if message is not None:
             sent += 1
     return sent
+
+
+ACTIVITY_DONE_TEXT = "Готово"
+ACTIVITY_NOT_DONE_TEXT = "Не готово"
+ACTIVITY_UNVOTE_NOTE = (
+    "Отметьте «Готово», если выполнили. Повторное нажатие снимает отметку."
+)
+
+
+async def _post_activity_poll(
+    bot: Bot,
+    db: Database,
+    activity: dict,
+    run_date: date,
+) -> None:
+    description = (activity["description"] or "").strip()
+    available = max(0, 250 - len(ACTIVITY_UNVOTE_NOTE) - 2)
+    description = description[:available]
+    poll_description = (
+        f"{description}\n\n{ACTIVITY_UNVOTE_NOTE}" if description else ACTIVITY_UNVOTE_NOTE
+    )
+    message = await bot.send_poll(
+        activity["chat_id"],
+        question=f"Активность: {activity['title']}",
+        options=[
+            InputPollOption(text=ACTIVITY_DONE_TEXT),
+            InputPollOption(text=ACTIVITY_NOT_DONE_TEXT),
+        ],
+        is_anonymous=False,
+        allows_multiple_answers=True,
+        allows_revoting=True,
+        description=poll_description,
+    )
+    if message.poll is not None:
+        await db.save_activity_poll(
+            message.poll.id,
+            activity["id"],
+            activity["chat_id"],
+            run_date,
+        )
+
+
+async def send_activity(
+    bot: Bot,
+    db: Database,
+    config: Config,
+    activity_id: int,
+    scheduler: AsyncIOScheduler,
+) -> None:
+    activity = await db.get_activity(activity_id)
+    if activity is None or not activity["active"]:
+        return
+    if not await db.is_chat_active(activity["chat_id"]):
+        return
+
+    run_date = _today(config)
+    try:
+        await _post_activity_poll(bot, db, activity, run_date)
+    except Exception:
+        logging.exception("Не удалось отправить активность %s", activity_id)
+        return
+
+    if activity["days"] == "once":
+        await db.deactivate_activity(activity_id)
+        _remove_activity_job(scheduler, activity_id)
+
+
+def _add_activity_job(
+    scheduler: AsyncIOScheduler,
+    bot: Bot,
+    db: Database,
+    config: Config,
+    activity: dict,
+) -> None:
+    job_id = f"activity:{activity['id']}"
+    hour, minute = (int(part) for part in activity["run_time"].split(":"))
+    if activity["days"] == "once":
+        run_date = date.fromisoformat(activity["run_date"])
+        trigger = DateTrigger(
+            run_date=datetime.combine(
+                run_date, time(hour, minute), tzinfo=config.timezone
+            )
+        )
+    else:
+        kwargs = {"hour": hour, "minute": minute, "timezone": config.timezone}
+        if activity["days"] != "daily":
+            kwargs["day_of_week"] = activity["days"]
+        trigger = CronTrigger(**kwargs)
+    scheduler.add_job(
+        send_activity,
+        trigger,
+        args=[bot, db, config, activity["id"], scheduler],
+        id=job_id,
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+
+def _remove_activity_job(scheduler: AsyncIOScheduler, activity_id: int) -> None:
+    try:
+        scheduler.remove_job(f"activity:{activity_id}")
+    except JobLookupError:
+        pass
 
 
 async def _send_chart(
@@ -501,6 +697,331 @@ async def cmd_poll(
         await message.reply("Опрос не отправлен: нет групп в рассылке или не настроены варианты (/addoption).")
 
 
+async def _send_activity_list(message: Message, db: Database) -> None:
+    activities = await db.list_activities(message.chat.id)
+    if not activities:
+        await message.answer("Активностей пока нет. Создать: /activity add")
+        return
+
+    lines = ["<b>Активности этой группы</b>"]
+    for activity in activities:
+        schedule = _schedule_label(
+            str(activity["days"]),
+            activity["run_date"],
+            str(activity["run_time"]),
+        )
+        lines.append(f"#{activity['id']} {html.escape(str(activity['title']))} — {schedule}")
+    lines.append("\nУдалить: <code>/activity del ID</code>")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("activity"))
+async def cmd_activity(
+    message: Message,
+    command: CommandObject,
+    bot: Bot,
+    db: Database,
+    config: Config,
+    scheduler: AsyncIOScheduler,
+    state: FSMContext,
+) -> None:
+    if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        await message.reply("Активности создаются в группе.")
+        return
+    if not await _can_manage_options(message, bot, config):
+        await message.reply(
+            "Недостаточно прав. Команда доступна администраторам группы или владельцу бота."
+        )
+        return
+    if message.from_user is None:
+        return
+    await _register_group(message, db)
+
+    args = (command.args or "").split()
+    action = args[0].lower() if args else ""
+    if action in {"", "list"}:
+        await _send_activity_list(message, db)
+        return
+    if action == "add":
+        await state.clear()
+        await state.set_state(ActivityForm.title)
+        await state.update_data(
+            owner_id=message.from_user.id,
+            chat_id=message.chat.id,
+        )
+        await message.reply(
+            "Введите название активности (до 100 символов), например «10 приседаний».\n"
+            "/cancel — отмена."
+        )
+        return
+    if action == "del":
+        if len(args) < 2 or not args[1].isdigit():
+            await message.reply("Использование: <code>/activity del ID</code>")
+            return
+        activity_id = int(args[1])
+        if await db.deactivate_activity(activity_id, chat_id=message.chat.id):
+            _remove_activity_job(scheduler, activity_id)
+            await message.reply(f"Активность #{activity_id} удалена.")
+        else:
+            await message.reply("Активность с таким ID не найдена в этой группе.")
+        return
+
+    await message.reply(
+        "Использование:\n"
+        "/activity — список\n"
+        "/activity add — создать\n"
+        "/activity del ID — удалить"
+    )
+
+
+@router.message(Command("motivation"))
+async def cmd_motivation(message: Message, bot: Bot, config: Config) -> None:
+    if not await _can_manage_options(message, bot, config):
+        await message.reply(
+            "Недостаточно прав. Команда доступна администраторам группы или владельцу бота."
+        )
+        return
+    await message.answer(_motivation_text(config))
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    if not data:
+        await message.reply("Нечего отменять.")
+        return
+    await state.clear()
+    await message.reply("Создание активности отменено.")
+
+
+@router.message(ActivityForm.title, _not_command)
+async def activity_title(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if not text or text.startswith("/"):
+        await message.reply("Введите название текстом или /cancel.")
+        return
+    if len(text) > 100:
+        await message.reply("Слишком длинное название. Максимум 100 символов.")
+        return
+    await state.update_data(title=text)
+    await state.set_state(ActivityForm.description)
+    await message.reply(
+        "Теперь описание и задание (до 180 символов). Оно будет видно в опросе."
+    )
+
+
+@router.message(ActivityForm.description, _not_command)
+async def activity_description(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if not text or text.startswith("/"):
+        await message.reply("Введите описание текстом или /cancel.")
+        return
+    if len(text) > 180:
+        await message.reply("Слишком длинное описание. Максимум 180 символов.")
+        return
+    await state.update_data(description=text)
+    await state.set_state(ActivityForm.schedule)
+    await message.reply(
+        "Когда публиковать активность?",
+        reply_markup=_schedule_keyboard(),
+    )
+
+
+async def _activity_callback_owner(
+    callback: CallbackQuery, state: FSMContext
+) -> dict | None:
+    data = await state.get_data()
+    if not data:
+        await callback.answer(
+            "Создание уже завершено или отменено.",
+            show_alert=True,
+        )
+        return None
+    if callback.from_user.id != data.get("owner_id"):
+        await callback.answer(
+            "Эту активность создаёт другой администратор.",
+            show_alert=True,
+        )
+        return None
+    return data
+
+
+@router.callback_query(F.data.startswith("act:sched:"), ActivityForm.schedule)
+async def activity_schedule(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _activity_callback_owner(callback, state) is None:
+        return
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    action = (callback.data or "").rsplit(":", 1)[-1]
+    if action == "weekdays":
+        await state.update_data(days="mon,tue,wed,thu,fri")
+        await state.set_state(ActivityForm.run_time)
+        await callback.message.edit_text(
+            "Время публикации в формате ЧЧ:ММ (например, 15:45)."
+        )
+    elif action == "daily":
+        await state.update_data(days="daily")
+        await state.set_state(ActivityForm.run_time)
+        await callback.message.edit_text(
+            "Время публикации в формате ЧЧ:ММ (например, 15:45)."
+        )
+    elif action == "once":
+        await state.update_data(days="once")
+        await state.set_state(ActivityForm.run_date)
+        await callback.message.edit_text(
+            "Дата публикации в формате ГГГГ-ММ-ДД или ДД.ММ.ГГГГ."
+        )
+    elif action == "custom":
+        await state.update_data(days="", selected_days=[])
+        await state.set_state(ActivityForm.custom_days)
+        await callback.message.edit_text(
+            "Выберите дни недели и нажмите «Готово».",
+            reply_markup=_weekdays_keyboard([]),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("act:day:"), ActivityForm.custom_days)
+async def activity_toggle_day(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _activity_callback_owner(callback, state) is None:
+        return
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    day = (callback.data or "").rsplit(":", 1)[-1]
+    data = await state.get_data()
+    selected = set(data.get("selected_days", []))
+    if day in selected:
+        selected.remove(day)
+    elif day in WEEKDAY_LABELS:
+        selected.add(day)
+    ordered = [code for code, _ in WEEKDAYS if code in selected]
+    await state.update_data(selected_days=ordered)
+    await callback.message.edit_reply_markup(reply_markup=_weekdays_keyboard(ordered))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "act:days:done", ActivityForm.custom_days)
+async def activity_days_done(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await _activity_callback_owner(callback, state)
+    if data is None:
+        return
+    selected = data.get("selected_days", [])
+    if not selected:
+        await callback.answer("Выберите хотя бы один день.", show_alert=True)
+        return
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    await state.update_data(days=",".join(selected))
+    await state.set_state(ActivityForm.run_time)
+    await callback.message.edit_text(
+        "Время публикации в формате ЧЧ:ММ (например, 15:45)."
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "act:cancel")
+async def activity_cancel_callback(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    if await _activity_callback_owner(callback, state) is None:
+        return
+    if callback.message is not None:
+        await callback.message.edit_text("Создание активности отменено.")
+    await state.clear()
+    await callback.answer()
+
+
+@router.message(ActivityForm.run_date, _not_command)
+async def activity_run_date(
+    message: Message, state: FSMContext, config: Config
+) -> None:
+    text = (message.text or "").strip()
+    if not text or text.startswith("/"):
+        await message.reply("Введите дату текстом или /cancel.")
+        return
+    parsed = _parse_date(text)
+    if parsed is None:
+        await message.reply("Не поняла дату. Формат: 2026-10-25 или 25.10.2026.")
+        return
+    if parsed < _today(config):
+        await message.reply("Дата уже прошла. Укажите будущую дату.")
+        return
+    await state.update_data(run_date=parsed.isoformat())
+    await state.set_state(ActivityForm.run_time)
+    await message.reply("Время публикации в формате ЧЧ:ММ (например, 15:45).")
+
+
+@router.message(ActivityForm.run_time, _not_command)
+async def activity_run_time(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db: Database,
+    config: Config,
+    scheduler: AsyncIOScheduler,
+) -> None:
+    text = (message.text or "").strip()
+    if not text or text.startswith("/"):
+        await message.reply("Введите время текстом или /cancel.")
+        return
+    parsed = _parse_time_value(text)
+    if parsed is None:
+        await message.reply("Не поняла время. Формат: 15:45.")
+        return
+
+    data = await state.get_data()
+    if (
+        not data
+        or "chat_id" not in data
+        or "title" not in data
+        or "description" not in data
+        or not data.get("days")
+    ):
+        await state.clear()
+        await message.reply("Не удалось восстановить данные. Начните заново: /activity add")
+        return
+
+    hour, minute = parsed
+    run_time = f"{hour:02d}:{minute:02d}"
+    days = str(data["days"])
+    if days == "once":
+        run_date = date.fromisoformat(str(data["run_date"]))
+        run_at = datetime.combine(
+            run_date, time(hour, minute), tzinfo=config.timezone
+        )
+        if run_at <= datetime.now(config.timezone):
+            await message.reply("Это время уже прошло. Укажите другое.")
+            return
+
+    activity_id = await db.add_activity(
+        chat_id=int(data["chat_id"]),
+        title=str(data["title"]),
+        description=str(data["description"]),
+        days=days,
+        run_date=data.get("run_date"),
+        run_time=run_time,
+    )
+    activity = await db.get_activity(activity_id)
+    if activity is not None:
+        _add_activity_job(scheduler, bot, db, config, activity)
+
+    await state.clear()
+    schedule = _schedule_label(days, data.get("run_date"), run_time)
+    await message.reply(
+        "✅ Активность создана.\n\n"
+        f"<b>{html.escape(str(data['title']))}</b>\n"
+        f"{html.escape(str(data['description']))}\n\n"
+        f"Когда: {schedule}\n"
+        f"ID: <code>{activity_id}</code>"
+    )
+
+
 @router.message(Command("my"))
 async def cmd_my(
     message: Message,
@@ -636,6 +1157,26 @@ async def on_poll_answer(answer: PollAnswer, db: Database) -> None:
     if answer.user is None:
         return
 
+    activity_poll = await db.get_activity_poll(answer.poll_id)
+    if activity_poll is not None:
+        if not answer.option_ids:
+            await db.delete_activity_answer(
+                activity_poll["activity_id"],
+                activity_poll["run_date"],
+                activity_poll["chat_id"],
+                answer.user.id,
+            )
+        else:
+            await db.set_activity_answer(
+                activity_poll["activity_id"],
+                activity_poll["run_date"],
+                activity_poll["chat_id"],
+                answer.user.id,
+                _display_name(answer.user),
+                0 in answer.option_ids,
+            )
+        return
+
     poll = await db.get_poll(answer.poll_id)
     if poll is None:
         return
@@ -676,6 +1217,15 @@ async def send_weekly_report(bot: Bot, db: Database, config: Config) -> None:
             await _send_chart(bot, db, chat_id, start, end, "daily")
         except Exception:
             logging.exception("Не удалось отправить еженедельный отчёт в чат %s", chat_id)
+
+
+async def send_motivation(bot: Bot, db: Database, config: Config) -> None:
+    text = _motivation_text(config)
+    for chat_id in await _active_chat_ids(db, config):
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception:
+            logging.exception("Не удалось отправить мотивацию в чат %s", chat_id)
 
 
 async def cleanup_old_answers(bot: Bot, db: Database, config: Config) -> None:
@@ -726,7 +1276,7 @@ async def main() -> None:
                 exc,
             )
 
-    dispatcher = Dispatcher()
+    dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(router)
 
     scheduler = AsyncIOScheduler(timezone=config.timezone)
@@ -753,6 +1303,19 @@ async def main() -> None:
         id="weekly_report",
         replace_existing=True,
     )
+    scheduler.add_job(
+        send_motivation,
+        CronTrigger(
+            day_of_week=config.motivation_day,
+            hour=config.motivation_hour,
+            minute=config.motivation_minute,
+            timezone=config.timezone,
+        ),
+        args=[bot, db, config],
+        id="weekly_motivation",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
     if config.retention_days > 0:
         scheduler.add_job(
             cleanup_old_answers,
@@ -761,6 +1324,21 @@ async def main() -> None:
             id="cleanup_old_answers",
             replace_existing=True,
         )
+
+    activity_count = 0
+    for activity in await db.list_active_activities():
+        if activity["days"] == "once":
+            run_date = date.fromisoformat(str(activity["run_date"]))
+            hour, minute = (int(part) for part in str(activity["run_time"]).split(":"))
+            run_at = datetime.combine(
+                run_date, time(hour, minute), tzinfo=config.timezone
+            )
+            if run_at <= datetime.now(config.timezone):
+                await db.deactivate_activity(int(activity["id"]))
+                continue
+        _add_activity_job(scheduler, bot, db, config, activity)
+        activity_count += 1
+
     scheduler.start()
 
     logging.info(
@@ -770,18 +1348,23 @@ async def main() -> None:
         len(await db.list_chats()),
     )
     logging.info(
-        "Ежедневный опрос: %02d:%02d. Еженедельный отчёт: %s в %02d:%02d.",
+        "Ежедневный опрос: %02d:%02d. Еженедельный отчёт: %s в %02d:%02d. "
+        "Мотивация: %s в %02d:%02d. Активностей в расписании: %d.",
         config.poll_hour,
         config.poll_minute,
         config.weekly_report_day,
         config.weekly_report_hour,
         config.weekly_report_minute,
+        config.motivation_day,
+        config.motivation_hour,
+        config.motivation_minute,
+        activity_count,
     )
     if config.retention_days > 0:
         logging.info("Автоочистка ответов старше %d дней включена.", config.retention_days)
 
     try:
-        await dispatcher.start_polling(bot, db=db, config=config)
+        await dispatcher.start_polling(bot, db=db, config=config, scheduler=scheduler)
     finally:
         scheduler.shutdown(wait=False)
         await bot.session.close()

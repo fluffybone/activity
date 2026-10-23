@@ -3,7 +3,7 @@ from __future__ import annotations
 import colorsys
 import json
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator
 
 import aiosqlite
@@ -60,6 +60,36 @@ CREATE TABLE IF NOT EXISTS polls (
     poll_date TEXT NOT NULL,
     option_ids TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS activities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    days TEXT NOT NULL,
+    run_date TEXT,
+    run_time TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS activity_polls (
+    poll_id TEXT PRIMARY KEY,
+    activity_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    run_date TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS activity_answers (
+    activity_id INTEGER NOT NULL,
+    run_date TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    user_name TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (activity_id, run_date, chat_id, user_id)
+);
 """
 
 
@@ -102,6 +132,13 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_answers_chat_date ON answers (chat_id, poll_date)"
         )
         await db.execute("CREATE INDEX IF NOT EXISTS idx_polls_date ON polls (poll_date)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_activities_chat ON activities (chat_id)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_activity_answers_date ON activity_answers (run_date)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_activity_polls_date ON activity_polls (run_date)"
+        )
 
     async def _chat_option_count(self, db: aiosqlite.Connection, chat_id: int) -> int:
         cursor = await db.execute(
@@ -314,8 +351,13 @@ class Database:
     async def delete_user_answers(self, user_id: int) -> int:
         async with self._connect() as db:
             cursor = await db.execute("DELETE FROM answers WHERE user_id = ?", (user_id,))
+            deleted = cursor.rowcount
+            cursor = await db.execute(
+                "DELETE FROM activity_answers WHERE user_id = ?", (user_id,)
+            )
+            deleted += cursor.rowcount
             await db.commit()
-            return cursor.rowcount
+            return deleted
 
     async def delete_answers_before(self, cutoff: date) -> int:
         async with self._connect() as db:
@@ -323,12 +365,22 @@ class Database:
                 "DELETE FROM answers WHERE poll_date < ?",
                 (cutoff.isoformat(),),
             )
+            deleted = cursor.rowcount
             await db.execute(
                 "DELETE FROM polls WHERE poll_date < ?",
                 (cutoff.isoformat(),),
             )
+            cursor = await db.execute(
+                "DELETE FROM activity_answers WHERE run_date < ?",
+                (cutoff.isoformat(),),
+            )
+            deleted += cursor.rowcount
+            await db.execute(
+                "DELETE FROM activity_polls WHERE run_date < ?",
+                (cutoff.isoformat(),),
+            )
             await db.commit()
-            return cursor.rowcount
+            return deleted
 
     async def add_chat(self, chat_id: int, title: str = "") -> None:
         async with self._connect() as db:
@@ -360,3 +412,164 @@ class Database:
             cursor = await db.execute(query)
             rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    async def is_chat_active(self, chat_id: int) -> bool:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT active FROM chats WHERE chat_id = ?", (chat_id,)
+            )
+            row = await cursor.fetchone()
+        return bool(row and row["active"])
+
+    async def add_activity(
+        self,
+        chat_id: int,
+        title: str,
+        description: str,
+        days: str,
+        run_date: str | None,
+        run_time: str,
+    ) -> int:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO activities
+                    (chat_id, title, description, days, run_date, run_time, active, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                """,
+                (
+                    chat_id,
+                    title,
+                    description,
+                    days,
+                    run_date,
+                    run_time,
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                ),
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def list_activities(
+        self, chat_id: int, active_only: bool = True
+    ) -> list[dict[str, Any]]:
+        query = (
+            "SELECT id, chat_id, title, description, days, run_date, run_time, "
+            "active, created_at FROM activities WHERE chat_id = ?"
+        )
+        if active_only:
+            query += " AND active = 1"
+        query += " ORDER BY id"
+        async with self._connect() as db:
+            cursor = await db.execute(query, (chat_id,))
+            rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def list_active_activities(self) -> list[dict[str, Any]]:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT id, chat_id, title, description, days, run_date, run_time, "
+                "active, created_at FROM activities WHERE active = 1 ORDER BY id"
+            )
+            rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_activity(self, activity_id: int) -> dict[str, Any] | None:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT id, chat_id, title, description, days, run_date, run_time, "
+                "active, created_at FROM activities WHERE id = ?",
+                (activity_id,),
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    async def deactivate_activity(
+        self, activity_id: int, chat_id: int | None = None
+    ) -> bool:
+        query = "UPDATE activities SET active = 0 WHERE id = ? AND active = 1"
+        params: list[Any] = [activity_id]
+        if chat_id is not None:
+            query += " AND chat_id = ?"
+            params.append(chat_id)
+        async with self._connect() as db:
+            cursor = await db.execute(query, params)
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def save_activity_poll(
+        self, poll_id: str, activity_id: int, chat_id: int, run_date: date
+    ) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO activity_polls (poll_id, activity_id, chat_id, run_date)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(poll_id) DO UPDATE SET
+                    activity_id = excluded.activity_id,
+                    chat_id = excluded.chat_id,
+                    run_date = excluded.run_date
+                """,
+                (poll_id, activity_id, chat_id, run_date.isoformat()),
+            )
+            await db.commit()
+
+    async def get_activity_poll(self, poll_id: str) -> dict[str, Any] | None:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT poll_id, activity_id, chat_id, run_date "
+                "FROM activity_polls WHERE poll_id = ?",
+                (poll_id,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "poll_id": row["poll_id"],
+            "activity_id": row["activity_id"],
+            "chat_id": row["chat_id"],
+            "run_date": date.fromisoformat(row["run_date"]),
+        }
+
+    async def set_activity_answer(
+        self,
+        activity_id: int,
+        run_date: date,
+        chat_id: int,
+        user_id: int,
+        user_name: str,
+        done: bool,
+    ) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO activity_answers
+                    (activity_id, run_date, chat_id, user_id, user_name, done, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(activity_id, run_date, chat_id, user_id) DO UPDATE SET
+                    user_name = excluded.user_name,
+                    done = excluded.done,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    activity_id,
+                    run_date.isoformat(),
+                    chat_id,
+                    user_id,
+                    user_name,
+                    int(done),
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                ),
+            )
+            await db.commit()
+
+    async def delete_activity_answer(
+        self, activity_id: int, run_date: date, chat_id: int, user_id: int
+    ) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM activity_answers "
+                "WHERE activity_id = ? AND run_date = ? AND chat_id = ? AND user_id = ?",
+                (activity_id, run_date.isoformat(), chat_id, user_id),
+            )
+            await db.commit()
